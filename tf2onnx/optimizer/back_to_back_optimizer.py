@@ -204,9 +204,19 @@ class BackToBackOptimizer(GraphOptimizerBase):
         if set(node2.output) & set(g.outputs):
             return []
 
-        if not node.inputs[1].is_const():
-            return []
-        weights = node.inputs[1].get_tensor_value(as_list=False)
+        # support bn fusion for quantized conv, 
+        # ie quant -> dequant -> conv(node) -> bn -> quant -> dequant
+        is_quant_node = node.inputs[1].type == 'DequantizeLinear'
+        if is_quant_node:
+            assert node.inputs[1].inputs[0].type == 'QuantizeLinear'
+            dequant_node = node.inputs[1]
+            quant_node = dequant_node.inputs[0]
+            weights = quant_node.inputs[0].get_tensor_value(as_list=False)
+        else:
+            if not node.inputs[1].is_const():
+                return []
+            weights = node.inputs[1].get_tensor_value(as_list=False)
+
         # if not 4D, NCHW skip
         if len(weights.shape) != 4:
             return []
@@ -227,7 +237,7 @@ class BackToBackOptimizer(GraphOptimizerBase):
         for i in range(1, len(node2.output)):
             if g.find_output_consumers(node2.output[i]):
                 return []
-
+        
         weights = weights.transpose(2, 3, 1, 0)
         scale = node2.inputs[1].get_tensor_value(as_list=False)
         offset = node2.inputs[2].get_tensor_value(as_list=False)
@@ -241,7 +251,36 @@ class BackToBackOptimizer(GraphOptimizerBase):
         bias_new = (bias - mean) * scale_new + offset
         bias_new_const = g.make_const(node.name + '_bias_fused_bn', bias_new.astype(bias.dtype))
         weights_new_const = g.make_const(node.name + '_weights_fused_bn', weights_new.astype(weights.dtype))
-        g.replace_inputs(node, [node.input[0], weights_new_const.output[0], bias_new_const.output[0]])
+        
+        if is_quant_node: 
+            zero_point = quant_node.inputs[2].get_tensor_value()
+            if zero_point != 0:
+                return []
+            
+            q_scale = quant_node.inputs[1].get_tensor_value(as_list=False)
+            per_tensor = len(q_scale.shape) == 0
+            # recompute scaling factor for the new weights
+            if per_tensor:
+                max_w = np.max(weights_new)
+                min_w = np.min(weights_new)
+            else:
+                out_dims = weights_new.shape[0]
+                max_w = np.max(np.reshape(weights_new, (out_dims, -1)), axis=-1)
+                min_w = np.min(np.reshape(weights_new, (out_dims, -1)), axis=-1)
+            
+            num_bits = 8
+            q_scale_new = np.maximum(np.abs(min_w), np.abs(max_w)) / (2**(num_bits-1)-1)
+            q_scale_new_const = g.make_const(
+                quant_node.inputs[1].name + '_fused_bn_quant', q_scale_new.astype(q_scale.dtype))
+            g.replace_inputs(
+                quant_node, 
+                [weights_new_const.output[0], q_scale_new_const.output[0], quant_node.input[2]])
+            g.replace_inputs(
+                dequant_node, 
+                [dequant_node.input[0], q_scale_new_const.output[0], quant_node.input[2]])
+            g.replace_inputs(node, [node.input[0], node.input[1], bias_new_const.output[0]])
+        else:
+            g.replace_inputs(node, [node.input[0], weights_new_const.output[0], bias_new_const.output[0]])
 
         # fuse conv and bn, delete bn
         node2_output = node2.output[:1]
